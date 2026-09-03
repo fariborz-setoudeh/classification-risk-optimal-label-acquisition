@@ -1,0 +1,2933 @@
+############################################################
+# DRY BEAN REAL-DATA STUDY
+# Classification-Risk-Optimal Label Acquisition
+#
+# Fixed analysis protocol (chosen BEFORE comparing methods):
+#   - remove exact duplicate rows
+#   - repeated stratified 70/30 train/test splits
+#   - training-only centering/scaling and PCA
+#   - retain first 5 PCs
+#   - semi-supervised Gaussian QDA (7-component Gaussian mixture
+#     with observed labels fixed and unlabelled labels latent)
+#   - 5% random pilot labels
+#   - total label budgets: 10%, 20%, 30%
+#   - methods: Random, Entropy, Margin, Fisher, Adaptive risk-optimal
+#   - each target budget is designed independently from the same pilot fit
+#   - Fisher and AdaptiveRisk use a certified Frank--Wolfe solver for the
+#     relaxed finite-pool convex design, followed by deterministic top-B rounding
+#   - primary outcome: test classification error
+#   - secondary outcome: balanced classification error
+#
+# IMPORTANT:
+# Run first with TEST_MODE <- TRUE.
+# If the test run completes cleanly, set TEST_MODE <- FALSE.
+############################################################
+
+rm(list = ls())
+gc()
+
+############################################################
+# 0. Packages
+############################################################
+
+required_packages <- c("readxl")
+
+missing_packages <- required_packages[
+  !(required_packages %in% rownames(installed.packages()))
+]
+
+if(length(missing_packages) > 0){
+  install.packages(missing_packages)
+}
+
+library(readxl)
+
+############################################################
+# 1. User settings
+############################################################
+
+DATA_FILE <- "Dry_Bean_Dataset.xlsx"
+
+SEED_MASTER <- 20260901L
+
+TEST_MODE <- FALSE
+
+# In TEST_MODE the certified design solver is allowed up to 600 iterations.
+# In the final run it is allowed up to 1200 iterations. Convergence is judged
+# by the relative Frank--Wolfe optimality gap, not by iteration count alone.
+
+# Final recommendation:
+N_REP_FINAL <- 50L
+
+N_REP <- if(TEST_MODE) 2L else N_REP_FINAL
+
+TRAIN_FRAC <- 0.70
+
+N_PC <- 5L
+
+PILOT_FRAC <- 0.05
+
+BUDGETS <- c(0.10, 0.20, 0.30)
+
+METHODS <- c(
+  "Random",
+  "Entropy",
+  "Margin",
+  "Fisher",
+  "AdaptiveRisk"
+)
+
+# Semi-supervised Gaussian-mixture EM
+EM_MAXIT <- if(TEST_MODE) 100L else 300L
+EM_TOL <- 1e-7
+
+# Small numerical covariance floor.
+# This is numerical stabilization, not a tuning parameter selected
+# according to method performance.
+COV_FLOOR_REL <- 1e-6
+
+# Information-matrix inverse floor
+INFO_EIG_FLOOR_REL <- 1e-8
+
+# Boundary-kernel settings used to estimate H_R
+BOUNDARY_BW_MIN <- 0.05
+BOUNDARY_BW_MAX <- 1.00
+BOUNDARY_KERNEL_CUTOFF <- 4.0
+
+# Require at least this many near-boundary observations for a pair
+MIN_BOUNDARY_POINTS <- 10L
+
+# Console progress
+VERBOSE <- TRUE
+
+############################################################
+# 2. Basic utilities
+############################################################
+
+log_sum_exp_rows <- function(M){
+  m <- apply(M, 1L, max)
+  m + log(rowSums(exp(M - m)))
+}
+
+softmax_rows <- function(logM){
+  z <- log_sum_exp_rows(logM)
+  exp(logM - z)
+}
+
+symmetrize <- function(M){
+  (M + t(M)) / 2
+}
+
+regularize_cov <- function(S, rel_floor = COV_FLOOR_REL){
+  S <- symmetrize(S)
+  
+  ee <- eigen(S, symmetric = TRUE)
+  
+  base <- max(mean(diag(S)), 1e-10)
+  floor_val <- rel_floor * base
+  
+  vals <- pmax(ee$values, floor_val)
+  
+  S2 <- ee$vectors %*% (vals * t(ee$vectors))
+  symmetrize(S2)
+}
+
+safe_inverse <- function(M, rel_floor = INFO_EIG_FLOOR_REL){
+  M <- symmetrize(M)
+  
+  ee <- eigen(M, symmetric = TRUE)
+  
+  maxeig <- max(ee$values)
+  floor_val <- max(rel_floor * max(maxeig, 1), 1e-12)
+  
+  vals <- pmax(ee$values, floor_val)
+  
+  out <- ee$vectors %*% ((1 / vals) * t(ee$vectors))
+  symmetrize(out)
+}
+
+row_quad_bilinear <- function(A, M, B){
+  # Returns row-wise A_i' M B_i.
+  rowSums((A %*% M) * B)
+}
+
+balanced_error <- function(truth, pred, levels_all){
+  truth <- factor(truth, levels = levels_all)
+  pred  <- factor(pred,  levels = levels_all)
+  
+  errs <- sapply(levels_all, function(k){
+    ind <- truth == k
+    if(!any(ind)) return(NA_real_)
+    mean(pred[ind] != truth[ind])
+  })
+  
+  mean(errs, na.rm = TRUE)
+}
+
+class_error_vector <- function(truth, pred, levels_all){
+  truth <- factor(truth, levels = levels_all)
+  pred  <- factor(pred,  levels = levels_all)
+  
+  out <- sapply(levels_all, function(k){
+    ind <- truth == k
+    if(!any(ind)) return(NA_real_)
+    mean(pred[ind] != truth[ind])
+  })
+  
+  names(out) <- levels_all
+  out
+}
+
+############################################################
+# 3. Stratified train/test split
+############################################################
+
+stratified_split <- function(y, train_frac, seed){
+  set.seed(seed)
+  
+  lev <- levels(y)
+  
+  train_idx <- integer(0)
+  
+  for(k in lev){
+    idx <- which(y == k)
+    nk_train <- floor(train_frac * length(idx))
+    
+    train_idx <- c(
+      train_idx,
+      sample(idx, size = nk_train, replace = FALSE)
+    )
+  }
+  
+  train_idx <- sort(train_idx)
+  test_idx <- setdiff(seq_along(y), train_idx)
+  
+  list(
+    train = train_idx,
+    test = test_idx
+  )
+}
+
+############################################################
+# 4. Training-only standardization and PCA
+############################################################
+
+fit_preprocess <- function(X_train, n_pc = N_PC){
+  mu <- colMeans(X_train)
+  ss <- apply(X_train, 2L, sd)
+  
+  if(any(!is.finite(ss)) || any(ss <= 0)){
+    stop("A training predictor has zero or non-finite standard deviation.")
+  }
+  
+  Xs <- sweep(X_train, 2L, mu, "-")
+  Xs <- sweep(Xs, 2L, ss, "/")
+  
+  pca <- prcomp(
+    Xs,
+    center = FALSE,
+    scale. = FALSE
+  )
+  
+  list(
+    center = mu,
+    scale = ss,
+    rotation = pca$rotation[, seq_len(n_pc), drop = FALSE],
+    sdev = pca$sdev
+  )
+}
+
+apply_preprocess <- function(X, prep){
+  Xs <- sweep(X, 2L, prep$center, "-")
+  Xs <- sweep(Xs, 2L, prep$scale, "/")
+  
+  Xs %*% prep$rotation
+}
+
+############################################################
+# 5. Gaussian density calculations
+############################################################
+
+log_dmvnorm_chol <- function(X, mu, Sigma){
+  d <- ncol(X)
+  
+  Sigma <- regularize_cov(Sigma)
+  
+  R <- chol(Sigma)
+  
+  XC <- sweep(X, 2L, mu, "-")
+  
+  # Solve R' z = x' row-by-row through forwardsolve.
+  Z <- t(
+    forwardsolve(
+      t(R),
+      t(XC)
+    )
+  )
+  
+  mahal <- rowSums(Z^2)
+  
+  logdet <- 2 * sum(log(diag(R)))
+  
+  -0.5 * (
+    d * log(2 * pi) +
+      logdet +
+      mahal
+  )
+}
+
+compute_log_joint <- function(X, fit){
+  n <- nrow(X)
+  g <- length(fit$pi)
+  
+  out <- matrix(
+    NA_real_,
+    nrow = n,
+    ncol = g
+  )
+  
+  for(k in seq_len(g)){
+    out[, k] <-
+      log(fit$pi[k]) +
+      log_dmvnorm_chol(
+        X,
+        fit$mu[k, ],
+        fit$Sigma[[k]]
+      )
+  }
+  
+  colnames(out) <- fit$classes
+  out
+}
+
+predict_ss_qda <- function(fit, X){
+  lj <- compute_log_joint(X, fit)
+  post <- softmax_rows(lj)
+  
+  cls <- fit$classes[max.col(post, ties.method = "first")]
+  
+  list(
+    class = factor(cls, levels = fit$classes),
+    posterior = post,
+    log_joint = lj
+  )
+}
+
+############################################################
+# 6. Semi-supervised QDA / Gaussian mixture EM
+############################################################
+
+fit_ss_qda <- function(
+    X,
+    y,
+    labelled,
+    classes,
+    maxit = EM_MAXIT,
+    tol = EM_TOL,
+    cov_floor_rel = COV_FLOOR_REL
+){
+  n <- nrow(X)
+  d <- ncol(X)
+  g <- length(classes)
+  
+  y <- factor(y, levels = classes)
+  
+  lab_idx <- which(labelled)
+  
+  if(length(lab_idx) == 0L){
+    stop("No pilot labels supplied.")
+  }
+  
+  pilot_counts <- table(
+    factor(y[lab_idx], levels = classes)
+  )
+  
+  if(any(pilot_counts <= d + 1L)){
+    stop(
+      paste0(
+        "Pilot has too few observations for at least one class. Counts: ",
+        paste(names(pilot_counts), pilot_counts, collapse = ", "),
+        ". Increase PILOT_FRAC only if this recurs systematically."
+      )
+    )
+  }
+  
+  global_mu <- colMeans(X)
+  global_S <- regularize_cov(cov(X), cov_floor_rel)
+  
+  pi_k <- as.numeric(pilot_counts + 0.5)
+  pi_k <- pi_k / sum(pi_k)
+  
+  mu_k <- matrix(
+    NA_real_,
+    nrow = g,
+    ncol = d
+  )
+  
+  Sigma_k <- vector("list", g)
+  
+  for(k in seq_len(g)){
+    idx <- lab_idx[y[lab_idx] == classes[k]]
+    
+    mu_k[k, ] <- colMeans(X[idx, , drop = FALSE])
+    
+    Sk <- cov(X[idx, , drop = FALSE])
+    
+    if(any(!is.finite(Sk))){
+      Sk <- global_S
+    }
+    
+    Sigma_k[[k]] <- regularize_cov(
+      Sk,
+      cov_floor_rel
+    )
+  }
+  
+  old_ll <- -Inf
+  
+  resp <- matrix(
+    0,
+    nrow = n,
+    ncol = g
+  )
+  
+  for(iter in seq_len(maxit)){
+    
+    fit_now <- list(
+      pi = pi_k,
+      mu = mu_k,
+      Sigma = Sigma_k,
+      classes = classes
+    )
+    
+    log_joint <- compute_log_joint(X, fit_now)
+    
+    # Unlabelled posterior memberships
+    resp[,] <- softmax_rows(log_joint)
+    
+    # Labelled observations remain fixed to their observed classes
+    resp[lab_idx, ] <- 0
+    
+    lab_class_num <- match(
+      as.character(y[lab_idx]),
+      classes
+    )
+    
+    resp[cbind(lab_idx, lab_class_num)] <- 1
+    
+    Nk <- colSums(resp)
+    
+    if(any(Nk <= d + 1)){
+      stop("EM produced an effectively empty class.")
+    }
+    
+    pi_new <- Nk / n
+    
+    mu_new <- matrix(
+      0,
+      nrow = g,
+      ncol = d
+    )
+    
+    Sigma_new <- vector("list", g)
+    
+    for(k in seq_len(g)){
+      wk <- resp[, k]
+      
+      mu_new[k, ] <-
+        colSums(X * wk) / Nk[k]
+      
+      XC <- sweep(
+        X,
+        2L,
+        mu_new[k, ],
+        "-"
+      )
+      
+      S <- crossprod(
+        XC * sqrt(wk)
+      ) / Nk[k]
+      
+      Sigma_new[[k]] <- regularize_cov(
+        S,
+        cov_floor_rel
+      )
+    }
+    
+    # Observed-data log likelihood:
+    # labelled observations use their known class;
+    # unlabelled observations use the mixture likelihood.
+    unl_idx <- which(!labelled)
+    
+    ll_unl <- if(length(unl_idx) > 0L){
+      sum(log_sum_exp_rows(log_joint[unl_idx, , drop = FALSE]))
+    } else {
+      0
+    }
+    
+    ll_lab <- sum(
+      log_joint[
+        cbind(
+          lab_idx,
+          lab_class_num
+        )
+      ]
+    )
+    
+    ll <- ll_unl + ll_lab
+    
+    pi_k <- pi_new
+    mu_k <- mu_new
+    Sigma_k <- Sigma_new
+    
+    if(iter > 1L){
+      rel_change <- abs(ll - old_ll) / (1 + abs(old_ll))
+      
+      if(rel_change < tol){
+        break
+      }
+    }
+    
+    old_ll <- ll
+  }
+  
+  fit <- list(
+    pi = pi_k,
+    mu = mu_k,
+    Sigma = Sigma_k,
+    classes = classes,
+    logLik = ll,
+    iterations = iter,
+    pilot_counts = pilot_counts
+  )
+  
+  fit
+}
+
+############################################################
+# 7. Parameter indexing for Gaussian QDA
+############################################################
+
+vech_pairs <- function(d){
+  out <- which(lower.tri(matrix(0, d, d), diag = TRUE), arr.ind = TRUE)
+  
+  # which() returns column-major order, which is a standard vech ordering.
+  out
+}
+
+build_param_index <- function(g, d){
+  n_alpha <- g - 1L
+  n_cov <- d * (d + 1L) / 2L
+  block_size <- d + n_cov
+  
+  alpha_idx <- seq_len(n_alpha)
+  
+  class_blocks <- vector("list", g)
+  mu_blocks <- vector("list", g)
+  cov_blocks <- vector("list", g)
+  
+  pos <- n_alpha + 1L
+  
+  for(k in seq_len(g)){
+    mu_idx <- pos:(pos + d - 1L)
+    pos <- pos + d
+    
+    cov_idx <- pos:(pos + n_cov - 1L)
+    pos <- pos + n_cov
+    
+    mu_blocks[[k]] <- mu_idx
+    cov_blocks[[k]] <- cov_idx
+    class_blocks[[k]] <- c(mu_idx, cov_idx)
+  }
+  
+  list(
+    alpha = alpha_idx,
+    mu = mu_blocks,
+    cov = cov_blocks,
+    class = class_blocks,
+    n_alpha = n_alpha,
+    n_cov = n_cov,
+    class_block_size = block_size,
+    p = pos - 1L,
+    vech_pairs = vech_pairs(d)
+  )
+}
+
+############################################################
+# 8. Class-score components
+############################################################
+
+prior_score_vectors <- function(pi_k){
+  g <- length(pi_k)
+  A <- matrix(
+    0,
+    nrow = g,
+    ncol = g - 1L
+  )
+  
+  base <- -pi_k[seq_len(g - 1L)]
+  
+  for(k in seq_len(g)){
+    A[k, ] <- base
+    
+    if(k < g){
+      A[k, k] <- A[k, k] + 1
+    }
+  }
+  
+  A
+}
+
+cov_score_matrix <- function(X, mu, Sigma, pairs){
+  n <- nrow(X)
+  d <- ncol(X)
+  m <- nrow(pairs)
+  
+  invS <- solve(Sigma)
+  
+  out <- matrix(
+    0,
+    nrow = n,
+    ncol = m
+  )
+  
+  for(i in seq_len(n)){
+    q <- X[i, ] - mu
+    
+    M <-
+      invS %*%
+      (tcrossprod(q) - Sigma) %*%
+      invS
+    
+    for(j in seq_len(m)){
+      a <- pairs[j, 1L]
+      b <- pairs[j, 2L]
+      
+      out[i, j] <- if(a == b){
+        0.5 * M[a, a]
+      } else {
+        M[a, b]
+      }
+    }
+  }
+  
+  out
+}
+
+compute_score_components <- function(X, fit, index){
+  n <- nrow(X)
+  g <- length(fit$pi)
+  d <- ncol(X)
+  
+  pred <- predict_ss_qda(fit, X)
+  
+  tau <- pred$posterior
+  log_joint <- pred$log_joint
+  
+  A <- prior_score_vectors(fit$pi)
+  
+  class_scores <- vector("list", g)
+  
+  for(k in seq_len(g)){
+    invS <- solve(fit$Sigma[[k]])
+    
+    XC <- sweep(
+      X,
+      2L,
+      fit$mu[k, ],
+      "-"
+    )
+    
+    mean_score <- XC %*% invS
+    
+    cov_score <- cov_score_matrix(
+      X,
+      fit$mu[k, ],
+      fit$Sigma[[k]],
+      index$vech_pairs
+    )
+    
+    class_scores[[k]] <- cbind(
+      mean_score,
+      cov_score
+    )
+  }
+  
+  # Marginal feature score \bar t(y).
+  bar <- matrix(
+    0,
+    nrow = n,
+    ncol = index$p
+  )
+  
+  # Prior-score part
+  bar[, index$alpha] <- tau %*% A
+  
+  # Class-specific blocks:
+  # only t_k has nonzero class-k block, so its posterior mean
+  # is tau_k * score_k.
+  for(k in seq_len(g)){
+    bar[, index$class[[k]]] <-
+      class_scores[[k]] * tau[, k]
+  }
+  
+  list(
+    tau = tau,
+    log_joint = log_joint,
+    A = A,
+    class_scores = class_scores,
+    bar = bar,
+    index = index
+  )
+}
+
+############################################################
+# 9. Empirical Fisher-information objects
+############################################################
+
+weighted_E_tt <- function(score_obj, weights){
+  # Computes:
+  # (1/n) sum_i weights_i sum_k tau_ik t_ik t_ik'
+  #
+  # Exploits sparsity of each class score t_k.
+  
+  tau <- score_obj$tau
+  A <- score_obj$A
+  Slist <- score_obj$class_scores
+  index <- score_obj$index
+  
+  n <- nrow(tau)
+  g <- ncol(tau)
+  P <- index$p
+  
+  M <- matrix(
+    0,
+    nrow = P,
+    ncol = P
+  )
+  
+  for(k in seq_len(g)){
+    wk <- weights * tau[, k]
+    
+    sw <- sum(wk)
+    
+    ak <- A[k, ]
+    
+    # alpha-alpha
+    M[index$alpha, index$alpha] <-
+      M[index$alpha, index$alpha] +
+      sw * tcrossprod(ak)
+    
+    Sk <- Slist[[k]]
+    Bk <- index$class[[k]]
+    
+    # alpha-class k
+    cross_ab <- tcrossprod(
+      ak,
+      colSums(Sk * wk)
+    )
+    
+    M[index$alpha, Bk] <-
+      M[index$alpha, Bk] +
+      cross_ab
+    
+    M[Bk, index$alpha] <-
+      M[Bk, index$alpha] +
+      t(cross_ab)
+    
+    # class k - class k
+    M[Bk, Bk] <-
+      M[Bk, Bk] +
+      crossprod(
+        Sk * sqrt(wk)
+      )
+  }
+  
+  symmetrize(M / n)
+}
+
+compute_information_objects <- function(score_obj, labelled){
+  n <- nrow(score_obj$tau)
+  
+  # Feature information
+  IY <- crossprod(score_obj$bar) / n
+  IY <- symmetrize(IY)
+  
+  # Complete-classification information:
+  # I_CC = E[t_Z t_Z']
+  ICC <- weighted_E_tt(
+    score_obj,
+    rep(1, n)
+  )
+  
+  # Label information retained at currently labelled points:
+  w_lab <- as.numeric(labelled)
+  
+  Ett_lab <- weighted_E_tt(
+    score_obj,
+    w_lab
+  )
+  
+  if(any(labelled)){
+    B <- score_obj$bar[labelled, , drop = FALSE]
+    
+    barbar_lab <- crossprod(B) / n
+  } else {
+    barbar_lab <- matrix(
+      0,
+      nrow = ncol(score_obj$bar),
+      ncol = ncol(score_obj$bar)
+    )
+  }
+  
+  J_lab <- Ett_lab - barbar_lab
+  
+  I_current <- IY + J_lab
+  
+  list(
+    IY = symmetrize(IY),
+    ICC = symmetrize(ICC),
+    J_lab = symmetrize(J_lab),
+    I = symmetrize(I_current)
+  )
+}
+
+############################################################
+# 10. Empirical active-face curvature H_R
+#
+# We use a kernel/coarea approximation of the boundary integral.
+#
+# For pair k,l, with ell_kl(y)=log r_k(y)-log r_l(y),
+#
+#   H_kl = integral_{F_kl}
+#          r_kl(s) delta_t delta_t' / ||grad ell_kl|| dS
+#
+# can be represented through a delta kernel in ell_kl.
+# Sampling y from the empirical feature distribution yields the
+# plug-in weight sqrt(tau_k tau_l) K_h(ell_kl), localized to
+# observations for which k and l are the two leading classes.
+#
+# Each contribution is an outer product, so the estimator is PSD.
+############################################################
+
+estimate_HR <- function(score_obj){
+  tau <- score_obj$tau
+  log_joint <- score_obj$log_joint
+  A <- score_obj$A
+  Slist <- score_obj$class_scores
+  index <- score_obj$index
+  
+  n <- nrow(tau)
+  g <- ncol(tau)
+  P <- index$p
+  
+  top1 <- max.col(
+    tau,
+    ties.method = "first"
+  )
+  
+  tau2 <- tau
+  tau2[cbind(seq_len(n), top1)] <- -Inf
+  
+  top2 <- max.col(
+    tau2,
+    ties.method = "first"
+  )
+  
+  H <- matrix(
+    0,
+    nrow = P,
+    ncol = P
+  )
+  
+  pair_diag <- list()
+  rr <- 1L
+  
+  for(k in seq_len(g - 1L)){
+    for(l in (k + 1L):g){
+      
+      active <-
+        (top1 == k & top2 == l) |
+        (top1 == l & top2 == k)
+      
+      n_active <- sum(active)
+      
+      if(n_active < MIN_BOUNDARY_POINTS){
+        pair_diag[[rr]] <- data.frame(
+          k = k,
+          l = l,
+          n_active = n_active,
+          bandwidth = NA_real_,
+          n_kernel = 0L,
+          weight_sum = 0
+        )
+        rr <- rr + 1L
+        next
+      }
+      
+      ell <- log_joint[, k] - log_joint[, l]
+      
+      ell_active <- ell[active]
+      
+      s_ell <- sd(ell_active)
+      
+      if(!is.finite(s_ell) || s_ell <= 0){
+        s_ell <- mad(ell_active, constant = 1)
+      }
+      
+      h <-
+        1.06 *
+        s_ell *
+        n_active^(-1 / 5)
+      
+      h <- max(
+        BOUNDARY_BW_MIN,
+        min(BOUNDARY_BW_MAX, h)
+      )
+      
+      keep <-
+        active &
+        abs(ell) <= BOUNDARY_KERNEL_CUTOFF * h
+      
+      idx <- which(keep)
+      
+      if(length(idx) < MIN_BOUNDARY_POINTS){
+        pair_diag[[rr]] <- data.frame(
+          k = k,
+          l = l,
+          n_active = n_active,
+          bandwidth = h,
+          n_kernel = length(idx),
+          weight_sum = 0
+        )
+        rr <- rr + 1L
+        next
+      }
+      
+      kern <-
+        dnorm(
+          ell[idx] / h
+        ) / h
+      
+      # Symmetric approximation to r_kl / p on the boundary.
+      w <-
+        sqrt(
+          pmax(tau[idx, k], 0) *
+            pmax(tau[idx, l], 0)
+        ) *
+        kern
+      
+      good <- is.finite(w) & w > 0
+      
+      idx <- idx[good]
+      w <- w[good]
+      
+      if(length(idx) < MIN_BOUNDARY_POINTS){
+        pair_diag[[rr]] <- data.frame(
+          k = k,
+          l = l,
+          n_active = n_active,
+          bandwidth = h,
+          n_kernel = length(idx),
+          weight_sum = sum(w)
+        )
+        rr <- rr + 1L
+        next
+      }
+      
+      D <- matrix(
+        0,
+        nrow = length(idx),
+        ncol = P
+      )
+      
+      # Prior-score difference
+      D[, index$alpha] <-
+        matrix(
+          A[k, ] - A[l, ],
+          nrow = length(idx),
+          ncol = index$n_alpha,
+          byrow = TRUE
+        )
+      
+      # Class k score and class l score
+      D[, index$class[[k]]] <-
+        Slist[[k]][idx, , drop = FALSE]
+      
+      D[, index$class[[l]]] <-
+        -Slist[[l]][idx, , drop = FALSE]
+      
+      H <-
+        H +
+        crossprod(
+          D * sqrt(w / n)
+        )
+      
+      pair_diag[[rr]] <- data.frame(
+        k = k,
+        l = l,
+        n_active = n_active,
+        bandwidth = h,
+        n_kernel = length(idx),
+        weight_sum = sum(w)
+      )
+      
+      rr <- rr + 1L
+    }
+  }
+  
+  H <- symmetrize(H)
+  
+  list(
+    H = H,
+    diagnostics = do.call(rbind, pair_diag)
+  )
+}
+
+############################################################
+# 11. Efficient pointwise value score
+#
+# For any target matrix L, let
+#
+#   G = I^{-1} L I^{-1}.
+#
+# The marginal label value is
+#
+#   tr{G J(y)}
+#   = E[t_Z' G t_Z | Y=y] - \bar t' G \bar t.
+#
+# Each t_k contains only:
+#   - the common prior-logit block, and
+#   - the class-k Gaussian block.
+#
+# We exploit that sparsity rather than constructing J(y) explicitly.
+############################################################
+
+classification_value_from_G <- function(
+    score_obj,
+    G,
+    candidate = NULL
+){
+  tau <- score_obj$tau
+  A <- score_obj$A
+  Slist <- score_obj$class_scores
+  index <- score_obj$index
+  
+  if(is.null(candidate)){
+    candidate <- seq_len(nrow(tau))
+  }
+  
+  tau_c <- tau[candidate, , drop = FALSE]
+  
+  g <- ncol(tau)
+  nc <- length(candidate)
+  
+  GAA <- G[index$alpha, index$alpha, drop = FALSE]
+  
+  # First term: sum_k tau_k q_kk
+  term1 <- numeric(nc)
+  
+  # Second term: sum_{k,l} tau_k tau_l q_kl
+  term2 <- numeric(nc)
+  
+  # Cache class score subsets
+  Sc <- lapply(
+    Slist,
+    function(S){
+      S[candidate, , drop = FALSE]
+    }
+  )
+  
+  # Diagonal q_kk
+  qdiag <- vector("list", g)
+  
+  for(k in seq_len(g)){
+    ak <- A[k, ]
+    Bk <- index$class[[k]]
+    Sk <- Sc[[k]]
+    
+    const <- as.numeric(
+      t(ak) %*% GAA %*% ak
+    )
+    
+    v_left <- as.numeric(
+      G[Bk, index$alpha, drop = FALSE] %*% ak
+    )
+    
+    lin <- 2 * as.numeric(
+      Sk %*% v_left
+    )
+    
+    bil <- row_quad_bilinear(
+      Sk,
+      G[Bk, Bk, drop = FALSE],
+      Sk
+    )
+    
+    qkk <- const + lin + bil
+    
+    qdiag[[k]] <- qkk
+    
+    term1 <- term1 + tau_c[, k] * qkk
+    
+    term2 <- term2 +
+      (tau_c[, k]^2) * qkk
+  }
+  
+  # Off-diagonal q_kl; q_lk=q_kl since G is symmetric.
+  for(k in seq_len(g - 1L)){
+    for(l in (k + 1L):g){
+      ak <- A[k, ]
+      al <- A[l, ]
+      
+      Bk <- index$class[[k]]
+      Bl <- index$class[[l]]
+      
+      Sk <- Sc[[k]]
+      Sl <- Sc[[l]]
+      
+      const <- as.numeric(
+        t(ak) %*% GAA %*% al
+      )
+      
+      # a_k' G_{A,Bl} s_l
+      v_l <- as.numeric(
+        G[Bl, index$alpha, drop = FALSE] %*% ak
+      )
+      
+      part_l <- as.numeric(
+        Sl %*% v_l
+      )
+      
+      # s_k' G_{Bk,A} a_l
+      v_k <- as.numeric(
+        G[Bk, index$alpha, drop = FALSE] %*% al
+      )
+      
+      part_k <- as.numeric(
+        Sk %*% v_k
+      )
+      
+      bil <- row_quad_bilinear(
+        Sk,
+        G[Bk, Bl, drop = FALSE],
+        Sl
+      )
+      
+      qkl <- const + part_l + part_k + bil
+      
+      term2 <- term2 +
+        2 *
+        tau_c[, k] *
+        tau_c[, l] *
+        qkl
+    }
+  }
+  
+  psi <- term1 - term2
+  
+  # Numerical roundoff can produce tiny negative values.
+  psi[psi < 0 & psi > -1e-8] <- 0
+  
+  psi
+}
+
+############################################################
+# 12. Acquisition scores
+############################################################
+
+score_entropy <- function(tau){
+  -rowSums(
+    tau * log(pmax(tau, 1e-15))
+  )
+}
+
+score_margin <- function(tau){
+  # Smaller top-two margin = more uncertain.
+  # Return negative margin so that "larger score is better".
+  sorted <- t(
+    apply(
+      tau,
+      1L,
+      sort,
+      decreasing = TRUE
+    )
+  )
+  
+  -(sorted[, 1L] - sorted[, 2L])
+}
+
+score_fisher <- function(score_obj, info_obj, candidate){
+  Iinv <- safe_inverse(info_obj$I)
+  
+  G <-
+    Iinv %*%
+    info_obj$ICC %*%
+    Iinv
+  
+  G <- symmetrize(G)
+  
+  classification_value_from_G(
+    score_obj,
+    G,
+    candidate
+  )
+}
+
+score_adaptive_risk <- function(
+    score_obj,
+    info_obj,
+    H,
+    candidate
+){
+  Iinv <- safe_inverse(info_obj$I)
+  
+  G <-
+    Iinv %*%
+    H %*%
+    Iinv
+  
+  G <- symmetrize(G)
+  
+  classification_value_from_G(
+    score_obj,
+    G,
+    candidate
+  )
+}
+
+############################################################
+# 13. Exact finite-pool convex design solver
+#
+# IMPORTANT:
+# This implements the criterion used in the paper:
+#
+#   min_a tr{ L I(a)^(-1) }
+#
+# subject to 0 <= a_i <= 1 and sum_i a_i = B,
+#
+# with the pilot labels fixed at acquisition probability 1.
+# The fitted model, J(y), I_Y and H_R are estimated ONCE from
+# the pilot, and each target budget is solved independently.
+############################################################
+
+project_capped_simplex <- function(v, B, tol = 1e-10){
+  n <- length(v)
+  
+  B <- max(0, min(B, n))
+  
+  if(B <= tol){
+    return(rep(0, n))
+  }
+  
+  if(B >= n - tol){
+    return(rep(1, n))
+  }
+  
+  lo <- min(v) - 1
+  hi <- max(v) + 1
+  
+  for(iter in seq_len(120L)){
+    lambda <- 0.5 * (lo + hi)
+    
+    a <- pmin(
+      1,
+      pmax(0, v - lambda)
+    )
+    
+    if(sum(a) > B){
+      lo <- lambda
+    } else {
+      hi <- lambda
+    }
+  }
+  
+  pmin(
+    1,
+    pmax(
+      0,
+      v - 0.5 * (lo + hi)
+    )
+  )
+}
+
+
+weighted_J_information <- function(
+    score_obj,
+    weights_full
+){
+  n <- nrow(score_obj$tau)
+  
+  Ett <- weighted_E_tt(
+    score_obj,
+    weights_full
+  )
+  
+  B <- score_obj$bar
+  
+  barbar <- crossprod(
+    B * sqrt(weights_full)
+  ) / n
+  
+  symmetrize(
+    Ett - barbar
+  )
+}
+
+
+build_information_from_design <- function(
+    score_obj,
+    pilot_labelled,
+    candidate,
+    a_candidate
+){
+  n <- nrow(score_obj$tau)
+  
+  w <- numeric(n)
+  
+  w[pilot_labelled] <- 1
+  w[candidate] <- a_candidate
+  
+  IY <- crossprod(
+    score_obj$bar
+  ) / n
+  
+  IY <- symmetrize(IY)
+  
+  Jw <- weighted_J_information(
+    score_obj,
+    w
+  )
+  
+  symmetrize(
+    IY + Jw
+  )
+}
+
+
+design_objective <- function(
+    score_obj,
+    pilot_labelled,
+    candidate,
+    a_candidate,
+    L
+){
+  Icur <- build_information_from_design(
+    score_obj,
+    pilot_labelled,
+    candidate,
+    a_candidate
+  )
+  
+  Iinv <- safe_inverse(Icur)
+  
+  sum(
+    L * t(Iinv)
+  )
+}
+
+
+solve_finite_pool_design <- function(
+    score_obj,
+    pilot_labelled,
+    candidate,
+    L,
+    B,
+    maxit = 1200L,
+    tol = 1e-5,
+    verbose = FALSE
+){
+  # Frank--Wolfe solver with an explicit global optimality certificate.
+  #
+  # Objective:
+  #   Phi(a) = tr{ L I(a)^(-1) }
+  #
+  # Feasible set:
+  #   0 <= a_i <= 1, sum_i a_i = B.
+  #
+  # Since I(a) is affine in a and Phi is convex on the positive-definite
+  # cone, the Frank--Wolfe gap is a valid upper bound on suboptimality.
+  #
+  # The gradient is
+  #   d Phi / d a_i = -(1/n) psi_a(Y_i),
+  # so the linear minimization oracle puts unit weight on the B candidate
+  # points having the largest current marginal values psi_a(Y_i).
+  
+  N <- length(candidate)
+  
+  B <- as.integer(
+    round(
+      min(
+        max(B, 0),
+        N
+      )
+    )
+  )
+  
+  if(B == 0L){
+    a0 <- rep(0, N)
+    
+    obj0 <- design_objective(
+      score_obj,
+      pilot_labelled,
+      candidate,
+      a0,
+      L
+    )
+    
+    return(
+      list(
+        a = a0,
+        objective = obj0,
+        iterations = 0L,
+        converged = TRUE,
+        fw_gap = 0,
+        relative_fw_gap = 0,
+        last_step = 0
+      )
+    )
+  }
+  
+  if(B == N){
+    a1 <- rep(1, N)
+    
+    obj1 <- design_objective(
+      score_obj,
+      pilot_labelled,
+      candidate,
+      a1,
+      L
+    )
+    
+    return(
+      list(
+        a = a1,
+        objective = obj1,
+        iterations = 0L,
+        converged = TRUE,
+        fw_gap = 0,
+        relative_fw_gap = 0,
+        last_step = 0
+      )
+    )
+  }
+  
+  n_total <- nrow(
+    score_obj$tau
+  )
+  
+  # Interior feasible starting point.
+  a <- rep(
+    B / N,
+    N
+  )
+  
+  Icur <- build_information_from_design(
+    score_obj,
+    pilot_labelled,
+    candidate,
+    a
+  )
+  
+  Iinv <- safe_inverse(
+    Icur
+  )
+  
+  obj <- sum(
+    L * t(Iinv)
+  )
+  
+  converged <- FALSE
+  fw_gap <- Inf
+  relative_fw_gap <- Inf
+  last_step <- NA_real_
+  
+  for(iter in seq_len(maxit)){
+    
+    Iinv <- safe_inverse(
+      Icur
+    )
+    
+    G <-
+      Iinv %*%
+      L %*%
+      Iinv
+    
+    G <- symmetrize(
+      G
+    )
+    
+    psi <- classification_value_from_G(
+      score_obj,
+      G,
+      candidate
+    )
+    
+    if(any(!is.finite(psi))){
+      stop(
+        "Non-finite Frank-Wolfe gradient."
+      )
+    }
+    
+    # Linear minimization oracle:
+    # maximize sum_i s_i psi_i subject to s in the capped simplex.
+    ord <- order(
+      psi,
+      decreasing = TRUE
+    )
+    
+    s <- numeric(
+      N
+    )
+    
+    s[
+      ord[seq_len(B)]
+    ] <- 1
+    
+    # Exact Frank--Wolfe gap:
+    # <a-s, grad Phi(a)>, where grad_i Phi = -psi_i/n_total.
+    fw_gap <-
+      sum(
+        (s - a) * psi
+      ) /
+      n_total
+    
+    # Numerical protection only.
+    if(
+      fw_gap < 0 &&
+      fw_gap > -1e-10
+    ){
+      fw_gap <- 0
+    }
+    
+    if(!is.finite(fw_gap)){
+      stop(
+        "Non-finite Frank-Wolfe gap."
+      )
+    }
+    
+    relative_fw_gap <-
+      fw_gap /
+      max(
+        abs(obj),
+        1e-12
+      )
+    
+    if(verbose && (
+      iter == 1L ||
+      iter %% 25L == 0L ||
+      relative_fw_gap <= tol
+    )){
+      cat(
+        "    FW iter=",
+        iter,
+        " objective=",
+        signif(obj, 10),
+        " gap=",
+        signif(fw_gap, 6),
+        " rel_gap=",
+        signif(relative_fw_gap, 6),
+        "
+",
+sep = ""
+      )
+    }
+    
+    if(
+      fw_gap >= 0 &&
+      relative_fw_gap <= tol
+    ){
+      converged <- TRUE
+      last_step <- 0
+      break
+    }
+    
+    # Information matrix at the Frank--Wolfe vertex s.
+    Is <- build_information_from_design(
+      score_obj,
+      pilot_labelled,
+      candidate,
+      s
+    )
+    
+    # Along the segment a(gamma)=(1-gamma)a+gamma s,
+    # information is exactly affine:
+    #   I(gamma)=(1-gamma)Icur+gamma Is.
+    line_objective <- function(gamma){
+      Ig <-
+        (1 - gamma) * Icur +
+        gamma * Is
+      
+      Ig_inv <- safe_inverse(
+        Ig
+      )
+      
+      sum(
+        L * t(Ig_inv)
+      )
+    }
+    
+    ls <- optimize(
+      line_objective,
+      interval = c(0, 1),
+      tol = 1e-8
+    )
+    
+    gamma <- ls$minimum
+    new_obj <- ls$objective
+    
+    # Compare also with both endpoints to avoid a numerical line-search
+    # artefact near gamma=0 or gamma=1.
+    obj0 <- obj
+    obj1 <- line_objective(1)
+    
+    if(obj0 <= new_obj && obj0 <= obj1){
+      gamma <- 0
+      new_obj <- obj0
+    } else if(obj1 < new_obj && obj1 < obj0){
+      gamma <- 1
+      new_obj <- obj1
+    }
+    
+    if(
+      !is.finite(new_obj) ||
+      new_obj > obj + 1e-9 * max(1, abs(obj))
+    ){
+      stop(
+        "Frank-Wolfe line search failed to produce a non-increasing objective."
+      )
+    }
+    
+    last_step <- gamma
+    
+    if(gamma <= 1e-12){
+      # If the line search says no movement is useful while the certified
+      # gap is still too large, stop and report non-convergence rather than
+      # pretending convergence.
+      break
+    }
+    
+    a <-
+      (1 - gamma) * a +
+      gamma * s
+    
+    # Enforce the feasible set against accumulated floating-point error.
+    a <- pmin(
+      1,
+      pmax(
+        0,
+        a
+      )
+    )
+    
+    # Renormalization should be tiny; projection is used only if required.
+    if(
+      abs(sum(a) - B) >
+      1e-8
+    ){
+      a <- project_capped_simplex(
+        a,
+        B
+      )
+    }
+    
+    Icur <-
+      (1 - gamma) * Icur +
+      gamma * Is
+    
+    Icur <- symmetrize(
+      Icur
+    )
+    
+    obj <- new_obj
+  }
+  
+  # Recompute the certificate at the returned design, including when
+  # maxit was reached immediately after an update.
+  Icur <- build_information_from_design(
+    score_obj,
+    pilot_labelled,
+    candidate,
+    a
+  )
+  
+  Iinv <- safe_inverse(
+    Icur
+  )
+  
+  obj <- sum(
+    L * t(Iinv)
+  )
+  
+  G <-
+    Iinv %*%
+    L %*%
+    Iinv
+  
+  G <- symmetrize(
+    G
+  )
+  
+  psi <- classification_value_from_G(
+    score_obj,
+    G,
+    candidate
+  )
+  
+  ord <- order(
+    psi,
+    decreasing = TRUE
+  )
+  
+  s <- numeric(
+    N
+  )
+  
+  s[
+    ord[seq_len(B)]
+  ] <- 1
+  
+  fw_gap <-
+    sum(
+      (s - a) * psi
+    ) /
+    n_total
+  
+  if(
+    fw_gap < 0 &&
+    fw_gap > -1e-10
+  ){
+    fw_gap <- 0
+  }
+  
+  relative_fw_gap <-
+    fw_gap /
+    max(
+      abs(obj),
+      1e-12
+    )
+  
+  converged <-
+    is.finite(relative_fw_gap) &&
+    fw_gap >= 0 &&
+    relative_fw_gap <= tol
+  
+  list(
+    a = a,
+    objective = obj,
+    iterations = iter,
+    converged = converged,
+    fw_gap = fw_gap,
+    relative_fw_gap = relative_fw_gap,
+    last_step = last_step
+  )
+}
+
+
+round_design_topB <- function(
+    design,
+    score_obj,
+    pilot_labelled,
+    candidate,
+    L,
+    B
+){
+  if(B <= 0){
+    selected <- integer(0)
+  } else {
+    selected <- order(
+      design$a,
+      decreasing = TRUE
+    )[seq_len(B)]
+  }
+  
+  a_round <- numeric(
+    length(candidate)
+  )
+  
+  if(length(selected) > 0){
+    a_round[selected] <- 1
+  }
+  
+  rounded_objective <- design_objective(
+    score_obj,
+    pilot_labelled,
+    candidate,
+    a_round,
+    L
+  )
+  
+  relaxed_objective <- design$objective
+  
+  rounding_loss_pct <-
+    100 *
+    (
+      rounded_objective -
+        relaxed_objective
+    ) /
+    max(
+      abs(relaxed_objective),
+      1e-12
+    )
+  
+  list(
+    selected = selected,
+    fractional_count = sum(
+      design$a > 1e-8 &
+        design$a < 1 - 1e-8
+    ),
+    fractional_prop = mean(
+      design$a > 1e-8 &
+        design$a < 1 - 1e-8
+    ),
+    relaxed_objective = relaxed_objective,
+    rounded_objective = rounded_objective,
+    rounding_loss_pct = rounding_loss_pct
+  )
+}
+
+############################################################
+# 14. Evaluate fitted classifier
+############################################################
+
+evaluate_fit <- function(
+    fit,
+    X_test_pc,
+    y_test,
+    classes
+){
+  pred <- predict_ss_qda(
+    fit,
+    X_test_pc
+  )
+  
+  err <- mean(
+    pred$class != y_test
+  )
+  
+  berr <- balanced_error(
+    y_test,
+    pred$class,
+    classes
+  )
+  
+  cerr <- class_error_vector(
+    y_test,
+    pred$class,
+    classes
+  )
+  
+  list(
+    error = err,
+    balanced_error = berr,
+    class_error = cerr
+  )
+}
+
+############################################################
+# 15. Load and clean Dry Bean data
+############################################################
+
+if(!file.exists(DATA_FILE)){
+  stop(
+    "Cannot find data file: ",
+    DATA_FILE
+  )
+}
+
+dat <- as.data.frame(
+  read_excel(DATA_FILE)
+)
+
+if(!"Class" %in% names(dat)){
+  stop("Column 'Class' was not found.")
+}
+
+dat$Class <- factor(dat$Class)
+
+predictor_names <- setdiff(
+  names(dat),
+  "Class"
+)
+
+if(!all(vapply(dat[predictor_names], is.numeric, logical(1)))){
+  stop("All predictors must be numeric.")
+}
+
+if(anyNA(dat)){
+  stop("Unexpected missing values found.")
+}
+
+n_before <- nrow(dat)
+
+dup_full <- duplicated(dat)
+
+dat <- dat[!dup_full, , drop = FALSE]
+rownames(dat) <- NULL
+
+n_after <- nrow(dat)
+
+cat("\n============================================================\n")
+cat("DRY BEAN DATA CLEANING\n")
+cat("============================================================\n")
+cat("Rows before duplicate removal:", n_before, "\n")
+cat("Exact duplicate rows removed:", sum(dup_full), "\n")
+cat("Rows retained:", n_after, "\n")
+
+# Check whether identical feature vectors remain with different labels.
+dup_X_remaining <- duplicated(
+  dat[predictor_names]
+) |
+  duplicated(
+    dat[predictor_names],
+    fromLast = TRUE
+  )
+
+if(any(dup_X_remaining)){
+  warning(
+    sum(dup_X_remaining),
+    " observations share an identical predictor vector after exact-row ",
+    "duplicate removal. Inspect before final analysis."
+  )
+}
+
+classes <- levels(dat$Class)
+
+cat("\nClass counts after cleaning:\n")
+print(table(dat$Class))
+
+############################################################
+# 16. Monte Carlo repeated-split experiment
+#
+# Each replication follows the two-stage procedure in the paper:
+#
+#   1. draw ONE common random pilot;
+#   2. fit the semi-supervised QDA once from that pilot;
+#   3. estimate J(y), I_Y, I_CC and H_R from the pilot fit;
+#   4. for EACH total budget, construct every acquisition rule
+#      from the SAME pilot fit;
+#   5. for Fisher and AdaptiveRisk, solve the relaxed finite-pool
+#      convex design and then use deterministic top-B rounding;
+#   6. refit the classifier after revealing the selected labels.
+#
+# No method is updated sequentially from the 10% result to the
+# 20% or 30% result. This is deliberate and matches the paper's
+# two-stage adaptive theory and the simulation implementation.
+############################################################
+
+raw_results <- list()
+class_results <- list()
+boundary_results <- list()
+design_results <- list()
+failure_log <- list()
+
+raw_rr <- 1L
+class_rr <- 1L
+bound_rr <- 1L
+design_rr <- 1L
+fail_rr <- 1L
+
+X_all <- as.matrix(
+  dat[, predictor_names, drop = FALSE]
+)
+
+y_all <- dat$Class
+
+for(rep_id in seq_len(N_REP)){
+  
+  if(VERBOSE){
+    cat(
+      "
+============================================================
+",
+      "Replication ", rep_id, " / ", N_REP, "
+",
+"============================================================
+",
+sep = ""
+    )
+  }
+  
+  split_seed <- SEED_MASTER + 10000L * rep_id
+  
+  sp <- stratified_split(
+    y_all,
+    TRAIN_FRAC,
+    split_seed
+  )
+  
+  X_train_raw <- X_all[sp$train, , drop = FALSE]
+  
+  y_train <- factor(
+    y_all[sp$train],
+    levels = classes
+  )
+  
+  X_test_raw <- X_all[sp$test, , drop = FALSE]
+  
+  y_test <- factor(
+    y_all[sp$test],
+    levels = classes
+  )
+  
+  prep <- fit_preprocess(
+    X_train_raw,
+    N_PC
+  )
+  
+  X_train_pc <- apply_preprocess(
+    X_train_raw,
+    prep
+  )
+  
+  X_test_pc <- apply_preprocess(
+    X_test_raw,
+    prep
+  )
+  
+  n_train <- nrow(
+    X_train_pc
+  )
+  
+  pilot_n <- ceiling(
+    PILOT_FRAC * n_train
+  )
+  
+  budget_n <- pmin(
+    n_train,
+    ceiling(BUDGETS * n_train)
+  )
+  
+  set.seed(
+    SEED_MASTER + 20000L * rep_id
+  )
+  
+  pilot_idx <- sample(
+    seq_len(n_train),
+    size = pilot_n,
+    replace = FALSE
+  )
+  
+  pilot_labelled <- rep(
+    FALSE,
+    n_train
+  )
+  
+  pilot_labelled[pilot_idx] <- TRUE
+  
+  candidate <- which(
+    !pilot_labelled
+  )
+  
+  pilot_counts <- table(
+    factor(
+      y_train[pilot_idx],
+      levels = classes
+    )
+  )
+  
+  if(VERBOSE){
+    cat("Training n:", n_train, "
+")
+    cat("Test n:", nrow(X_test_pc), "
+")
+    cat("Pilot n:", pilot_n, "
+")
+    cat("Pilot class counts:
+")
+    print(pilot_counts)
+  }
+  
+  if(any(pilot_counts <= N_PC + 1L)){
+    
+    failure_log[[fail_rr]] <- data.frame(
+      Replication = rep_id,
+      Method = "ALL",
+      Budget = NA_real_,
+      Reason = paste0(
+        "Insufficient pilot count: ",
+        paste(
+          names(pilot_counts),
+          as.integer(pilot_counts),
+          collapse = ", "
+        )
+      )
+    )
+    
+    fail_rr <- fail_rr + 1L
+    
+    warning(
+      "Skipping replication ",
+      rep_id,
+      " due to insufficient pilot count."
+    )
+    
+    next
+  }
+  
+  ##########################################################
+  # Pilot fit — shared by ALL methods and ALL budgets
+  ##########################################################
+  
+  pilot_fit <- tryCatch(
+    fit_ss_qda(
+      X_train_pc,
+      y_train,
+      pilot_labelled,
+      classes
+    ),
+    error = function(e) e
+  )
+  
+  if(inherits(pilot_fit, "error")){
+    
+    failure_log[[fail_rr]] <- data.frame(
+      Replication = rep_id,
+      Method = "ALL",
+      Budget = NA_real_,
+      Reason = paste0(
+        "Pilot fit failed: ",
+        conditionMessage(pilot_fit)
+      )
+    )
+    
+    fail_rr <- fail_rr + 1L
+    next
+  }
+  
+  pilot_pred <- predict_ss_qda(
+    pilot_fit,
+    X_train_pc
+  )
+  
+  entropy_all <- score_entropy(
+    pilot_pred$posterior
+  )
+  
+  margin_all <- score_margin(
+    pilot_pred$posterior
+  )
+  
+  index <- build_param_index(
+    g = length(classes),
+    d = ncol(X_train_pc)
+  )
+  
+  score_obj <- compute_score_components(
+    X_train_pc,
+    pilot_fit,
+    index
+  )
+  
+  # Complete-classification target for the Fisher design.
+  ICC_fit <- weighted_E_tt(
+    score_obj,
+    rep(1, n_train)
+  )
+  
+  ##########################################################
+  # Pilot-fitted classification-risk curvature — computed
+  # ONCE per replication, as required by the two-stage rule.
+  ##########################################################
+  
+  Hout <- tryCatch(
+    estimate_HR(
+      score_obj
+    ),
+    error = function(e) e
+  )
+  
+  if(inherits(Hout, "error")){
+    
+    failure_log[[fail_rr]] <- data.frame(
+      Replication = rep_id,
+      Method = "AdaptiveRisk",
+      Budget = NA_real_,
+      Reason = paste0(
+        "H_R estimation failed: ",
+        conditionMessage(Hout)
+      )
+    )
+    
+    fail_rr <- fail_rr + 1L
+    next
+  }
+  
+  Hfit <- Hout$H
+  
+  if(
+    !all(is.finite(Hfit)) ||
+    sum(abs(Hfit)) <= 0
+  ){
+    
+    failure_log[[fail_rr]] <- data.frame(
+      Replication = rep_id,
+      Method = "AdaptiveRisk",
+      Budget = NA_real_,
+      Reason = "H_R is non-finite or numerically zero."
+    )
+    
+    fail_rr <- fail_rr + 1L
+    next
+  }
+  
+  if(!is.null(Hout$diagnostics)){
+    
+    dd <- Hout$diagnostics
+    
+    dd$Replication <- rep_id
+    dd$ClassK <- classes[dd$k]
+    dd$ClassL <- classes[dd$l]
+    
+    boundary_results[[bound_rr]] <- dd
+    bound_rr <- bound_rr + 1L
+  }
+  
+  ##########################################################
+  # Each budget is constructed independently from the SAME
+  # pilot fit.
+  ##########################################################
+  
+  for(bi in seq_along(BUDGETS)){
+    
+    budget <- BUDGETS[bi]
+    total_n <- budget_n[bi]
+    
+    additional_B <-
+      total_n -
+      pilot_n
+    
+    if(additional_B <= 0L){
+      stop(
+        "PILOT_FRAC must be smaller than every total budget."
+      )
+    }
+    
+    additional_B <- min(
+      additional_B,
+      length(candidate)
+    )
+    
+    if(VERBOSE){
+      cat(
+        "
+Budget ",
+        sprintf("%.0f%%", 100 * budget),
+        " (additional labels=",
+        additional_B,
+        ")
+",
+        sep = ""
+      )
+    }
+    
+    ########################################################
+    # Random
+    ########################################################
+    
+    set.seed(
+      SEED_MASTER +
+        30000L * rep_id +
+        bi
+    )
+    
+    sel_random <- sample(
+      candidate,
+      size = additional_B,
+      replace = FALSE
+    )
+    
+    ########################################################
+    # Entropy
+    ########################################################
+    
+    sel_entropy <- candidate[
+      order(
+        entropy_all[candidate],
+        decreasing = TRUE
+      )[seq_len(additional_B)]
+    ]
+    
+    ########################################################
+    # Margin
+    ########################################################
+    
+    sel_margin <- candidate[
+      order(
+        margin_all[candidate],
+        decreasing = TRUE
+      )[seq_len(additional_B)]
+    ]
+    
+    ########################################################
+    # Fisher-information design
+    ########################################################
+    
+    Fisher_design <- tryCatch(
+      solve_finite_pool_design(
+        score_obj = score_obj,
+        pilot_labelled = pilot_labelled,
+        candidate = candidate,
+        L = ICC_fit,
+        B = additional_B,
+        maxit = if(TEST_MODE) 600L else 1200L,
+        tol = 1e-5,
+        verbose = FALSE
+      ),
+      error = function(e) e
+    )
+    
+    if(inherits(Fisher_design, "error")){
+      failure_log[[fail_rr]] <- data.frame(
+        Replication = rep_id,
+        Method = "Fisher",
+        Budget = budget,
+        Reason = conditionMessage(Fisher_design)
+      )
+      fail_rr <- fail_rr + 1L
+      next
+    }
+    
+    Fisher_round <- round_design_topB(
+      design = Fisher_design,
+      score_obj = score_obj,
+      pilot_labelled = pilot_labelled,
+      candidate = candidate,
+      L = ICC_fit,
+      B = additional_B
+    )
+    
+    sel_Fisher <- candidate[
+      Fisher_round$selected
+    ]
+    
+    ########################################################
+    # Adaptive classification-risk-optimal design
+    ########################################################
+    
+    Adaptive_design <- tryCatch(
+      solve_finite_pool_design(
+        score_obj = score_obj,
+        pilot_labelled = pilot_labelled,
+        candidate = candidate,
+        L = Hfit,
+        B = additional_B,
+        maxit = if(TEST_MODE) 600L else 1200L,
+        tol = 1e-5,
+        verbose = FALSE
+      ),
+      error = function(e) e
+    )
+    
+    if(inherits(Adaptive_design, "error")){
+      failure_log[[fail_rr]] <- data.frame(
+        Replication = rep_id,
+        Method = "AdaptiveRisk",
+        Budget = budget,
+        Reason = conditionMessage(Adaptive_design)
+      )
+      fail_rr <- fail_rr + 1L
+      next
+    }
+    
+    Adaptive_round <- round_design_topB(
+      design = Adaptive_design,
+      score_obj = score_obj,
+      pilot_labelled = pilot_labelled,
+      candidate = candidate,
+      L = Hfit,
+      B = additional_B
+    )
+    
+    sel_Adaptive <- candidate[
+      Adaptive_round$selected
+    ]
+    
+    ########################################################
+    # Design diagnostics
+    ########################################################
+    
+    design_results[[design_rr]] <- data.frame(
+      Replication = rep_id,
+      Budget = budget,
+      Method = c(
+        "Fisher",
+        "AdaptiveRisk"
+      ),
+      AdditionalBudget = additional_B,
+      Iterations = c(
+        Fisher_design$iterations,
+        Adaptive_design$iterations
+      ),
+      Converged = c(
+        Fisher_design$converged,
+        Adaptive_design$converged
+      ),
+      FWGap = c(
+        Fisher_design$fw_gap,
+        Adaptive_design$fw_gap
+      ),
+      RelativeFWGap = c(
+        Fisher_design$relative_fw_gap,
+        Adaptive_design$relative_fw_gap
+      ),
+      LastFWStep = c(
+        Fisher_design$last_step,
+        Adaptive_design$last_step
+      ),
+      FractionalCount = c(
+        Fisher_round$fractional_count,
+        Adaptive_round$fractional_count
+      ),
+      FractionalProp = c(
+        Fisher_round$fractional_prop,
+        Adaptive_round$fractional_prop
+      ),
+      RelaxedObjective = c(
+        Fisher_round$relaxed_objective,
+        Adaptive_round$relaxed_objective
+      ),
+      RoundedObjective = c(
+        Fisher_round$rounded_objective,
+        Adaptive_round$rounded_objective
+      ),
+      RoundingLossPct = c(
+        Fisher_round$rounding_loss_pct,
+        Adaptive_round$rounding_loss_pct
+      )
+    )
+    
+    design_rr <- design_rr + 1L
+    
+    ########################################################
+    # Evaluate all five methods
+    ########################################################
+    
+    selections <- list(
+      Random = sel_random,
+      Entropy = sel_entropy,
+      Margin = sel_margin,
+      Fisher = sel_Fisher,
+      AdaptiveRisk = sel_Adaptive
+    )
+    
+    for(method in METHODS){
+      
+      labelled <- pilot_labelled
+      labelled[selections[[method]]] <- TRUE
+      
+      fit_budget <- tryCatch(
+        fit_ss_qda(
+          X_train_pc,
+          y_train,
+          labelled,
+          classes
+        ),
+        error = function(e) e
+      )
+      
+      if(inherits(fit_budget, "error")){
+        
+        failure_log[[fail_rr]] <- data.frame(
+          Replication = rep_id,
+          Method = method,
+          Budget = budget,
+          Reason = conditionMessage(fit_budget)
+        )
+        
+        fail_rr <- fail_rr + 1L
+        next
+      }
+      
+      ev <- evaluate_fit(
+        fit_budget,
+        X_test_pc,
+        y_test,
+        classes
+      )
+      
+      raw_results[[raw_rr]] <- data.frame(
+        Replication = rep_id,
+        Method = method,
+        Budget = budget,
+        TrainN = n_train,
+        TestN = nrow(X_test_pc),
+        PilotN = pilot_n,
+        LabelledN = sum(labelled),
+        Error = ev$error,
+        BalancedError = ev$balanced_error,
+        EMIterations = fit_budget$iterations,
+        LogLik = fit_budget$logLik
+      )
+      
+      raw_rr <- raw_rr + 1L
+      
+      class_results[[class_rr]] <- data.frame(
+        Replication = rep_id,
+        Method = method,
+        Budget = budget,
+        Class = classes,
+        ClassError = as.numeric(
+          ev$class_error
+        )
+      )
+      
+      class_rr <- class_rr + 1L
+      
+      if(VERBOSE){
+        cat(
+          " ",
+          method,
+          ": error=",
+          sprintf("%.5f", ev$error),
+          ", balanced error=",
+          sprintf("%.5f", ev$balanced_error),
+          ", labels=",
+          sum(labelled),
+          "
+",
+sep = ""
+        )
+      }
+    }
+    
+    if(length(raw_results) > 0L){
+      write.csv(
+        do.call(rbind, raw_results),
+        "DryBean_realdata_raw_PROGRESS.csv",
+        row.names = FALSE
+      )
+    }
+  }
+}
+
+############################################################
+# 17. Assemble outputs
+############################################################
+
+if(length(raw_results) == 0L){
+  stop("No successful real-data results were produced.")
+}
+
+raw_df <- do.call(
+  rbind,
+  raw_results
+)
+
+class_df <- if(length(class_results) > 0L){
+  do.call(rbind, class_results)
+} else {
+  data.frame()
+}
+
+boundary_df <- if(length(boundary_results) > 0L){
+  do.call(rbind, boundary_results)
+} else {
+  data.frame()
+}
+
+design_df <- if(length(design_results) > 0L){
+  do.call(rbind, design_results)
+} else {
+  data.frame()
+}
+
+failure_df <- if(length(failure_log) > 0L){
+  do.call(rbind, failure_log)
+} else {
+  data.frame(
+    Replication = integer(),
+    Method = character(),
+    Budget = numeric(),
+    Reason = character()
+  )
+}
+
+############################################################
+# 18. Summary table
+############################################################
+
+summary_list <- list()
+ss <- 1L
+
+for(b in sort(unique(raw_df$Budget))){
+  for(m in METHODS){
+    
+    z <- raw_df[
+      raw_df$Budget == b &
+        raw_df$Method == m,
+      ,
+      drop = FALSE
+    ]
+    
+    if(nrow(z) == 0L){
+      next
+    }
+    
+    summary_list[[ss]] <- data.frame(
+      Budget = b,
+      Method = m,
+      NRep = nrow(z),
+      MeanError = mean(z$Error),
+      SEError = sd(z$Error) / sqrt(nrow(z)),
+      MeanBalancedError = mean(z$BalancedError),
+      SEBalancedError = sd(z$BalancedError) / sqrt(nrow(z))
+    )
+    
+    ss <- ss + 1L
+  }
+}
+
+summary_df <- do.call(
+  rbind,
+  summary_list
+)
+
+############################################################
+# 19. Paired comparisons: AdaptiveRisk versus each comparator
+############################################################
+
+paired_list <- list()
+pp <- 1L
+
+comparators <- setdiff(
+  METHODS,
+  "AdaptiveRisk"
+)
+
+for(b in sort(unique(raw_df$Budget))){
+  
+  ad <- raw_df[
+    raw_df$Budget == b &
+      raw_df$Method == "AdaptiveRisk",
+    c(
+      "Replication",
+      "Error",
+      "BalancedError"
+    ),
+    drop = FALSE
+  ]
+  
+  names(ad)[2:3] <- c(
+    "AdaptiveError",
+    "AdaptiveBalancedError"
+  )
+  
+  for(m in comparators){
+    
+    cm <- raw_df[
+      raw_df$Budget == b &
+        raw_df$Method == m,
+      c(
+        "Replication",
+        "Error",
+        "BalancedError"
+      ),
+      drop = FALSE
+    ]
+    
+    names(cm)[2:3] <- c(
+      "ComparatorError",
+      "ComparatorBalancedError"
+    )
+    
+    mm <- merge(
+      ad,
+      cm,
+      by = "Replication"
+    )
+    
+    if(nrow(mm) < 2L){
+      next
+    }
+    
+    # Positive difference = AdaptiveRisk has LOWER error.
+    d_err <-
+      mm$ComparatorError -
+      mm$AdaptiveError
+    
+    d_berr <-
+      mm$ComparatorBalancedError -
+      mm$AdaptiveBalancedError
+    
+    se_err <- sd(d_err) / sqrt(length(d_err))
+    se_berr <- sd(d_berr) / sqrt(length(d_berr))
+    
+    paired_list[[pp]] <- data.frame(
+      Budget = b,
+      Comparator = m,
+      NPaired = length(d_err),
+      
+      MeanImprovementError = mean(d_err),
+      SEImprovementError = se_err,
+      CI95LowError = mean(d_err) - 1.96 * se_err,
+      CI95HighError = mean(d_err) + 1.96 * se_err,
+      
+      MeanImprovementBalancedError = mean(d_berr),
+      SEImprovementBalancedError = se_berr,
+      CI95LowBalancedError = mean(d_berr) - 1.96 * se_berr,
+      CI95HighBalancedError = mean(d_berr) + 1.96 * se_berr
+    )
+    
+    pp <- pp + 1L
+  }
+}
+
+paired_df <- if(length(paired_list) > 0L){
+  do.call(rbind, paired_list)
+} else {
+  data.frame()
+}
+
+############################################################
+# 20. Class-wise summary
+############################################################
+
+class_summary <- data.frame()
+
+if(nrow(class_df) > 0L){
+  
+  cls_list <- list()
+  cc <- 1L
+  
+  for(b in sort(unique(class_df$Budget))){
+    for(m in METHODS){
+      for(k in classes){
+        
+        z <- class_df[
+          class_df$Budget == b &
+            class_df$Method == m &
+            class_df$Class == k,
+          ,
+          drop = FALSE
+        ]
+        
+        if(nrow(z) == 0L){
+          next
+        }
+        
+        cls_list[[cc]] <- data.frame(
+          Budget = b,
+          Method = m,
+          Class = k,
+          NRep = nrow(z),
+          MeanClassError = mean(
+            z$ClassError,
+            na.rm = TRUE
+          ),
+          SEClassError =
+            sd(
+              z$ClassError,
+              na.rm = TRUE
+            ) /
+            sqrt(
+              sum(is.finite(z$ClassError))
+            )
+        )
+        
+        cc <- cc + 1L
+      }
+    }
+  }
+  
+  class_summary <- do.call(
+    rbind,
+    cls_list
+  )
+}
+
+############################################################
+# 21. Save final outputs
+############################################################
+
+write.csv(
+  raw_df,
+  "DryBean_realdata_raw.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  summary_df,
+  "DryBean_realdata_summary.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  paired_df,
+  "DryBean_realdata_paired_comparisons.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  class_df,
+  "DryBean_realdata_class_raw.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  class_summary,
+  "DryBean_realdata_class_summary.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  boundary_df,
+  "DryBean_realdata_boundary_diagnostics.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  design_df,
+  "DryBean_realdata_design_diagnostics.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  failure_df,
+  "DryBean_realdata_failures.csv",
+  row.names = FALSE
+)
+
+############################################################
+# 22. Console summary
+############################################################
+
+cat("\n============================================================\n")
+cat("FINAL SUMMARY\n")
+cat("============================================================\n\n")
+
+print(summary_df)
+
+cat("\n============================================================\n")
+cat("PAIRED IMPROVEMENTS: comparator error - AdaptiveRisk error\n")
+cat("Positive values favor AdaptiveRisk\n")
+cat("============================================================\n\n")
+
+print(paired_df)
+
+cat("\n============================================================\n")
+cat("FAILURES\n")
+cat("============================================================\n\n")
+
+print(failure_df)
+
+cat("\n============================================================\n")
+cat("FILES WRITTEN\n")
+cat("============================================================\n")
+
+cat(
+  paste(
+    c(
+      "DryBean_realdata_raw.csv",
+      "DryBean_realdata_summary.csv",
+      "DryBean_realdata_paired_comparisons.csv",
+      "DryBean_realdata_class_raw.csv",
+      "DryBean_realdata_class_summary.csv",
+      "DryBean_realdata_boundary_diagnostics.csv",
+      "DryBean_realdata_design_diagnostics.csv",
+      "DryBean_realdata_failures.csv"
+    ),
+    collapse = "\n"
+  ),
+  "\n"
+)
+
+cat("\nSession information:\n")
+print(sessionInfo())
+
+cat("\nDONE.\n")
+
+
+
+#--------------------------------------------------
+
+library(ggplot2)
+library(dplyr)
+library(readr)
+
+res <- read_csv(
+  "DryBean_realdata_summary.csv",
+  show_col_types = FALSE
+)
+
+res <- res %>%
+  mutate(
+    Method = factor(
+      Method,
+      levels = c(
+        "Random",
+        "Entropy",
+        "Margin",
+        "Fisher",
+        "AdaptiveRisk"
+      )
+    )
+  )
+
+p <- ggplot(
+  res,
+  aes(
+    x = Budget,
+    y = MeanError,
+    group = Method,
+    linetype = Method,
+    shape = Method
+  )
+) +
+  geom_line(
+    linewidth = 0.85
+  ) +
+  geom_point(
+    size = 2.8
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = MeanError - 1.96 * SEError,
+      ymax = MeanError + 1.96 * SEError
+    ),
+    width = 0.007,
+    linewidth = 0.55
+  ) +
+  scale_x_continuous(
+    breaks = c(0.10, 0.20, 0.30),
+    labels = c("10%", "20%", "30%")
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(
+      accuracy = 0.001
+    )
+  ) +
+  labs(
+    x = "Total labeling budget",
+    y = "Test classification error",
+    linetype = "Acquisition rule",
+    shape = "Acquisition rule"
+  ) +
+  theme_bw(
+    base_size = 13
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(8, 12, 8, 8)
+  )
+
+ggsave(
+  "DryBean_realdata_error.pdf",
+  p,
+  width = 7.5,
+  height = 5.2,
+  device = cairo_pdf
+)
+
+ggsave(
+  "DryBean_realdata_error.png",
+  p,
+  width = 7.5,
+  height = 5.2,
+  dpi = 500
+)
+
+print(p)
+#######################################
